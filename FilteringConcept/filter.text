@@ -1,0 +1,37 @@
+
+    public function fetch(Request $request)
+    {
+
+        $query = Candidate::query();
+
+        if ($request->filled('isQualified')) {
+            $query->where('isQualified', $request->isQualified);
+        }
+
+        if ($request->filled('category')) {
+            $query->where('category', $request->category);
+        }
+
+        if ($request->filled('gender')) {
+            $query->where('gender', $request->gender);
+        }
+
+        if ($request->filled('subject_id')) {
+            $query->where('subject_id', $request->isAdmitCardAvailable);
+        }
+
+        if ($request->filled('jrf_type')) {
+
+            $column = $request->jrf_type;
+
+            $query->whereHas('basicDetail', function ($q) use ($column) {
+                $q->where($column, true);
+            });
+        }
+
+        $data = $query->latest()->get();
+
+        return response()->json([
+            'data' => $data
+        ]);
+    }
