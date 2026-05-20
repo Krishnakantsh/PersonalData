@@ -1,0 +1,107 @@
+
+    public function sendPushNotification($data, $collectionDetails = [], $for = '')
+    {
+
+        $db = db_connect($data->schoolName);
+
+        $this->CommonModel = new CommonModel($db);
+
+        if (
+            empty($collectionDetails)
+            && $this->request->getPost()
+        ) {
+
+            $collectionDetails
+                = $this->request->getPost();
+        }
+
+        $Desdata = [
+
+            'key1' => 'val1',
+            'key2' => 'val2'
+        ];
+
+        $title = $collectionDetails['title'] ?? '';
+        $body = $collectionDetails['msg'] ?? '';
+        $module = $collectionDetails['module'] ?? '';
+        $notification_id = $collectionDetails['notification_id'] ?? 0;
+        $device_tokens = $collectionDetails['device_tokens'] ?? [];
+        $firbase_key_path = 1;
+        $success = 0;
+        $failure = 0;
+        $responses = [];
+        $message_ids = [];
+        $device_tokens = array_filter(
+            array_unique($device_tokens)
+        );
+
+        foreach ($device_tokens as $token) {
+
+            if (empty($token)) {
+                continue;
+            }
+            $response = $this->sendNotification(
+                $token,
+                $title,
+                $body,
+                $Desdata,
+                $module,
+                $firbase_key_path
+            );
+
+            if ($response) {
+                preg_match(
+                    '/0:(\d+%[a-f0-9]+)/',
+                    $response,
+                    $matches
+                );
+                $message_ids[] = $matches[1] ?? 'Invalid Token';
+                $responses[] = $response;
+                $success++;
+            } else {
+                $failure++;
+                $message_ids[] = 'Invalid Token';
+            }
+        }
+
+        $is_success = ($success > 0);
+        $updateData = [
+            'provider_message_id' => implode(',', $message_ids),
+            'status' => $is_success ? 1 : 0,
+            'queue_status' => $is_success ? 'done' : 'failed',
+            'delivery_status' => $is_success ? 'sent' : 'failed',
+            'processed_at' => date('Y-m-d H:i:s'),
+            'provider_response' => json_encode($responses),
+            'attempt_count' => 1,
+            'last_error' => $is_success ? null : 'Failed to send notification',
+        ];
+
+        if ($notification_id) {
+
+            $this->CommonModel->updateRecord(
+                'sms_log',
+                $updateData,
+                [
+                    'id' => $notification_id
+                ]
+            );
+        }
+
+        $response = [
+
+            'success' => $is_success,
+            'status' => $is_success ? 1 : 0,
+            'ErrorMsg' => $is_success
+                ? 'Send Successfully'
+                : 'Failed to send notification',
+            'total_send' => $success,
+            'failed' => $failure,
+            'response' => $responses
+        ];
+
+        if ($for == 'function') {
+            return $response;
+        } else {
+            return $this->respond($response);
+        }
+    }      no response just analyze it 
