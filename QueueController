@@ -1,0 +1,794 @@
+no response just analyze     it   <?php
+
+namespace App\Controllers;
+
+use App\Controllers\BaseController;
+use App\Models\CommonModel;
+use Exception;
+
+class QueueController extends BaseController
+{
+    public function process()
+    {
+        helper(['sms_helper']);
+
+        $defaultDB = db_connect();
+
+        $CommonModel = new CommonModel($defaultDB);
+
+        $current_time = date('Y-m-d H:i:s');
+
+        $max_attempt   = 3;
+        $maxPacketSize = 60;
+
+        /*
+        |--------------------------------------------------------------------------
+        | TOTAL AVAILABLE TRACKERS
+        |--------------------------------------------------------------------------
+        |
+        | CASE 1:
+        | Multiple trackers available
+        | => one cron = one tracker
+        |
+        | CASE 2:
+        | Only one tracker available
+        | => all cron jobs work on same tracker
+        |
+        */
+
+        $totalTrackers = $defaultDB->table('queue_db_tracker')
+            ->where('pending_count >', 0)
+            ->countAllResults();
+
+        if ($totalTrackers <= 0) {
+            echo "No Queue Found";
+            return;
+        }
+
+        $tracker = null;
+
+        /*
+        |--------------------------------------------------------------------------
+        | MULTIPLE TRACKER MODE
+        |--------------------------------------------------------------------------
+        */
+
+        if ($totalTrackers > 1) {
+
+            // PICK AVAILABLE TRACKER
+
+            $tracker = $defaultDB->table('queue_db_tracker')
+                ->where('pending_count >', 0)
+                ->where('current_status', 'pending')
+                ->orderBy('id', 'ASC')
+                ->get(1)
+                ->getRowArray();
+
+            if (!$tracker) {
+                echo "No Available Tracker";
+                return;
+            }
+
+            // LOCK TRACKER
+
+            $defaultDB->table('queue_db_tracker')
+                ->where('id', $tracker['id'])
+                ->where('current_status', 'pending')
+                ->update([
+                    'current_status'   => 'running',
+                    'started_at'       => $current_time,
+                    'last_activity_at' => $current_time,
+                    'updated_at'       => $current_time
+                ]);
+
+            // ANOTHER CRON ALREADY PICKED THIS TRACKER
+
+            if (!$defaultDB->affectedRows()) {
+                echo "Tracker Already Running";
+                return;
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | SINGLE TRACKER MODE
+        |--------------------------------------------------------------------------
+        |
+        | No tracker locking
+        | Multiple cron jobs can process same tracker
+        | Record level locking will handle concurrency
+        |
+        */
+
+        else {
+
+            $tracker = $defaultDB->table('queue_db_tracker')
+                ->where('pending_count >', 0)
+                ->orderBy('id', 'ASC')
+                ->get(1)
+                ->getRowArray();
+
+            if (!$tracker) {
+                echo "No Tracker Found";
+                return;
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | SCHOOL DB CONNECT
+        |--------------------------------------------------------------------------
+        */
+
+        $schoolDB = db_connect($tracker['db_name']);
+
+        $SchoolCommonModel = new CommonModel($schoolDB);
+
+        /*
+        |--------------------------------------------------------------------------
+        | RELEASE STALE LOCKS
+        |--------------------------------------------------------------------------
+        */
+
+        $schoolDB->table('sms_log')
+            ->where('locked_at IS NOT NULL')
+            ->where(
+                'locked_at <',
+                date('Y-m-d H:i:s', strtotime('-5 minutes'))
+            )
+            ->update([
+                'locked_at'    => null,
+                'queue_status' => 'pending'
+            ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | FETCH RECORDS
+        |--------------------------------------------------------------------------
+        */
+
+        $records = $schoolDB->table('sms_log')
+            ->groupStart()
+                ->where('queue_status', 'pending')
+                ->orGroupStart()
+                    ->where('queue_status', 'failed')
+                    ->where('attempt_count <', $max_attempt)
+                ->groupEnd()
+            ->groupEnd()
+            ->where('locked_at IS NULL')
+            ->limit($maxPacketSize)
+            ->get()
+            ->getResultArray();
+
+        /*
+        |--------------------------------------------------------------------------
+        | NO RECORDS FOUND
+        |--------------------------------------------------------------------------
+        */
+
+        if (!$records) {
+
+            $finalTracker = $CommonModel->getResult(
+                '*',
+                'queue_db_tracker',
+                [
+                    'id' => $tracker['id']
+                ]
+            );
+
+            if ($finalTracker && $finalTracker['pending_count'] <= 0) {
+
+                $CommonModel->deleteRecord(
+                    'queue_db_tracker',
+                    [
+                        'id' => $tracker['id']
+                    ]
+                );
+            } else {
+
+                // MULTIPLE TRACKER MODE ONLY
+
+                if ($totalTrackers > 1) {
+
+                    $CommonModel->updateRecord(
+                        'queue_db_tracker',
+                        [
+                            'current_status'   => 'pending',
+                            'last_activity_at' => $current_time,
+                            'updated_at'       => $current_time
+                        ],
+                        [
+                            'id' => $tracker['id']
+                        ]
+                    );
+                }
+            }
+
+            echo "No Records";
+            return;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | PROCESS RECORDS
+        |--------------------------------------------------------------------------
+        */
+
+        foreach ($records as $record) {
+
+            /*
+            |--------------------------------------------------------------------------
+            | RECORD LOCK
+            |--------------------------------------------------------------------------
+            |
+            | THIS IS MAIN CONCURRENCY CONTROL
+            |
+            */
+
+            $schoolDB->table('sms_log')
+                ->where('id', $record['id'])
+                ->where('locked_at IS NULL')
+                ->update([
+                    'queue_status' => 'processing',
+                    'locked_at'    => date('Y-m-d H:i:s')
+                ]);
+
+            // ANOTHER CRON ALREADY PROCESSING
+
+            if (!$schoolDB->affectedRows()) {
+                continue;
+            }
+
+            try {
+
+                $payload = json_decode(
+                    $record['payload'],
+                    true
+                );
+
+                $send = [];
+
+                /*
+                |--------------------------------------------------------------------------
+                | NOTIFICATION PROCESS
+                |--------------------------------------------------------------------------
+                */
+
+                if ($record['type'] == 1) {
+
+                    $send = service('NotificationController')
+                        ->sendPushNotification(
+                            (object)[
+                                'schoolId'
+                                    => $record['school_id'],
+
+                                'sessionId'
+                                    => $record['session_id'],
+
+                                'schoolName'
+                                    => $tracker['db_name']
+                            ],
+                            $payload,
+                            'cron'
+                        );
+
+                    if (
+                        isset($send['success'])
+                        && $send['success']
+                    ) {
+
+                        $SchoolCommonModel->updateRecord(
+                            'sms_log',
+                            [
+                                'status'              => 1,
+                                'queue_status'        => 'done',
+                                'delivery_status'     => 'sent',
+                                'processed_at'        => date('Y-m-d H:i:s'),
+                                'provider_response'   => json_encode($send),
+                                'ErrorCode'           => 0,
+                                'ErrorMessage'        => 'success',
+                                'locked_at'           => null
+                            ],
+                            [
+                                'id' => $record['id']
+                            ]
+                        );
+                    } else {
+
+                        throw new Exception(
+                            $send['message']
+                                ?? 'Notification Failed'
+                        );
+                    }
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | WHATSAPP PROCESS
+                |--------------------------------------------------------------------------
+                */
+
+                else if ($record['type'] == 2) {
+
+                    $packet = $payload['packet'] ?? [];
+
+                    $send = SendWhatsAppCampaign(
+                        $packet,
+                        $payload['instance_id'],
+                        $payload['access_token']
+                    );
+
+                    if (
+                        isset($send['success'])
+                        && $send['success']
+                    ) {
+
+                        $SchoolCommonModel->updateRecord(
+                            'sms_log',
+                            [
+                                'status'                => 1,
+                                'queue_status'          => 'done',
+                                'delivery_status'       => 'sent',
+                                'processed_at'          => date('Y-m-d H:i:s'),
+                                'provider_response'     => json_encode($send),
+                                'provider_message_id'
+                                    => $send['message_id'] ?? null,
+                                'ErrorCode'             => 0,
+                                'ErrorMessage'          => 'success',
+                                'locked_at'             => null
+                            ],
+                            [
+                                'id' => $record['id']
+                            ]
+                        );
+                    } else {
+
+                        throw new Exception(
+                            $send['message']
+                                ?? 'WhatsApp Failed'
+                        );
+                    }
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | TRACKER SUCCESS UPDATE
+                |--------------------------------------------------------------------------
+                */
+
+                $defaultDB->table('queue_db_tracker')
+                    ->where('id', $tracker['id'])
+                    ->set(
+                        'pending_count',
+                        'GREATEST(pending_count - 1,0)',
+                        false
+                    )
+                    ->set(
+                        'done_count',
+                        'done_count + 1',
+                        false
+                    )
+                    ->set([
+                        'last_activity_at'
+                            => date('Y-m-d H:i:s'),
+
+                        'updated_at'
+                            => date('Y-m-d H:i:s')
+                    ])
+                    ->update();
+            } catch (Exception $e) {
+
+                $attempt_count
+                    = $record['attempt_count'] + 1;
+
+                $queue_status
+                    = ($attempt_count >= $max_attempt)
+                    ? 'failed'
+                    : 'pending';
+
+                /*
+                |--------------------------------------------------------------------------
+                | UPDATE FAILED RECORD
+                |--------------------------------------------------------------------------
+                */
+
+                $SchoolCommonModel->updateRecord(
+                    'sms_log',
+                    [
+                        'status'          => 0,
+                        'queue_status'    => $queue_status,
+                        'delivery_status' => 'failed',
+                        'attempt_count'   => $attempt_count,
+                        'last_error'      => $e->getMessage(),
+                        'ErrorCode'       => 1,
+                        'ErrorMessage'    => $e->getMessage(),
+                        'locked_at'       => null
+                    ],
+                    [
+                        'id' => $record['id']
+                    ]
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | TRACKER FAILED UPDATE
+                |--------------------------------------------------------------------------
+                */
+
+                $defaultDB->table('queue_db_tracker')
+                    ->where('id', $tracker['id'])
+                    ->set(
+                        'failed_count',
+                        'failed_count + 1',
+                        false
+                    )
+                    ->set([
+                        'last_activity_at'
+                            => date('Y-m-d H:i:s'),
+
+                        'updated_at'
+                            => date('Y-m-d H:i:s')
+                    ])
+                    ->update();
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | FINAL TRACKER CHECK
+        |--------------------------------------------------------------------------
+        */
+
+        $finalTracker = $CommonModel->getResult(
+            '*',
+            'queue_db_tracker',
+            [
+                'id' => $tracker['id']
+            ]
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | DELETE TRACKER IF COMPLETED
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+            $finalTracker
+            && $finalTracker['pending_count'] <= 0
+        ) {
+
+            $CommonModel->deleteRecord(
+                'queue_db_tracker',
+                [
+                    'id' => $tracker['id']
+                ]
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | UNLOCK TRACKER
+        |--------------------------------------------------------------------------
+        |
+        | ONLY IN MULTIPLE TRACKER MODE
+        |
+        */
+
+        else if ($totalTrackers > 1) {
+
+            $CommonModel->updateRecord(
+                'queue_db_tracker',
+                [
+                    'current_status'   => 'pending',
+
+                    'last_activity_at'
+                        => date('Y-m-d H:i:s'),
+
+                    'updated_at'
+                        => date('Y-m-d H:i:s')
+                ],
+                [
+                    'id' => $tracker['id']
+                ]
+            );
+        }
+
+        echo "Queue Processed";
+    }
+}
+
+// namespace App\Controllers;
+
+// use App\Controllers\BaseController;
+// use App\Models\CommonModel;
+// use Exception;
+
+// class QueueController extends BaseController
+// {
+    // public function process()
+    // {
+    //     helper(['sms_helper']);
+
+    //     $defaultDB = db_connect();
+
+    //     $CommonModel = new CommonModel($defaultDB);
+
+    //     $current_time = date('Y-m-d H:i:s');
+
+    //     $tracker = $defaultDB->table('queue_db_tracker')
+    //         ->where('pending_count >', 0)
+    //         ->where('current_status', 'pending')
+    //         ->orderBy('id', 'ASC')
+    //         ->get(1)
+    //         ->getRowArray();
+
+    //     if (!$tracker) {
+    //         echo "No Queue Found";
+    //         return;
+    //     }
+
+
+    //     $lockTracker = $defaultDB->table('queue_db_tracker')
+    //         ->where('id', $tracker['id'])
+    //         ->where('current_status', 'pending')
+    //         ->update([
+    //             'current_status'   => 'running',
+    //             'started_at'       => $current_time,
+    //             'last_activity_at' => $current_time,
+    //             'updated_at'       => $current_time
+    //         ]);
+
+
+    //     if (!$defaultDB->affectedRows()) {
+    //         echo "Tracker Already Running";
+    //         return;
+    //     }
+
+
+    //     $schoolDB = db_connect(
+    //         $tracker['db_name']
+    //     );
+
+    //     $SchoolCommonModel = new CommonModel($schoolDB);
+
+    //     $max_attempt   = 3;
+    //     $maxPacketSize = 60;
+
+
+    //     $records = $schoolDB->table('sms_log')
+    //         ->groupStart()
+    //         ->where('queue_status', 'pending')
+    //         ->orGroupStart()
+    //         ->where('queue_status', 'failed')
+    //         ->where(
+    //             'attempt_count <',
+    //             $max_attempt
+    //         )
+    //         ->groupEnd()
+    //         ->groupEnd()
+    //         ->where('locked_at IS NULL')
+    //         ->limit($maxPacketSize)
+    //         ->get()
+    //         ->getResultArray();
+
+    //     if (!$records) {
+
+    //         $CommonModel->deleteRecord(
+    //             'queue_db_tracker',
+    //             [
+    //                 'id' => $tracker['id']
+    //             ]
+    //         );
+    //         echo "No Records";
+    //         return;
+    //     }
+
+
+    //     foreach ($records as $record) {
+
+    //         $schoolDB->table('sms_log')
+    //             ->where('id', $record['id'])
+    //             ->where('locked_at IS NULL')
+    //             ->update([
+    //                 'queue_status' => 'processing',
+    //                 'locked_at'    => date('Y-m-d H:i:s')
+    //             ]);
+
+
+    //         if (!$schoolDB->affectedRows()) {
+    //             continue;
+    //         }
+
+    //         try {
+
+    //             $payload = json_decode(
+    //                 $record['payload'],
+    //                 true
+    //             );
+
+    //             $send = [];
+
+    //             if ($record['type'] == 1) {
+
+    //                 $send = service('NotificationController')
+    //                     ->sendPushNotification(
+    //                         (object)[
+    //                             'schoolId'
+    //                             => $record['school_id'],
+
+    //                             'sessionId'
+    //                             => $record['session_id'],
+
+    //                             'schoolName'
+    //                             => $tracker['db_name']
+    //                         ],
+    //                         $payload,
+    //                         'cron'
+    //                     );
+
+    //                 if (isset($send['success']) && $send['success']) {
+    //                     $SchoolCommonModel->updateRecord(
+    //                         'sms_log',
+    //                         [
+    //                             'status'            => 1,
+    //                             'queue_status'      => 'done',
+    //                             'delivery_status'   => 'sent',
+    //                             'processed_at'      => date('Y-m-d H:i:s'),
+    //                             'provider_response' => json_encode($send),
+    //                             'ErrorCode'         => 0,
+    //                             'ErrorMessage'      => 'success',
+    //                             'locked_at'         => null
+    //                         ],
+    //                         [
+    //                             'id' => $record['id']
+    //                         ]
+    //                     );
+    //                 } else {
+
+    //                     throw new Exception(
+    //                         $send['message']
+    //                             ?? 'Notification Failed'
+    //                     );
+    //                 }
+    //             } else if ($record['type'] == 2) {
+
+    //                 $packet = $payload['packet'] ?? [];
+
+    //                 $send = SendWhatsAppCampaign(
+    //                     $packet,
+    //                     $payload['instance_id'],
+    //                     $payload['access_token']
+    //                 );
+
+    //                 if (
+    //                     isset($send['success'])
+    //                     && $send['success']
+    //                 ) {
+
+    //                     $SchoolCommonModel->updateRecord(
+    //                         'sms_log',
+    //                         [
+    //                             'status'              => 1,
+    //                             'queue_status'        => 'done',
+    //                             'delivery_status'     => 'sent',
+    //                             'processed_at'        => date('Y-m-d H:i:s'),
+    //                             'provider_response'   => json_encode($send),
+    //                             'provider_message_id'
+    //                             => $send['message_id'] ?? null,
+    //                             'ErrorCode'           => 0,
+    //                             'ErrorMessage'        => 'success',
+    //                             'locked_at'           => null
+    //                         ],
+    //                         [
+    //                             'id' => $record['id']
+    //                         ]
+    //                     );
+    //                 } else {
+
+    //                     throw new Exception(
+    //                         $send['message']
+    //                             ?? 'WhatsApp Failed'
+    //                     );
+    //                 }
+    //             }
+
+
+    //             $defaultDB->table('queue_db_tracker')
+    //                 ->where('id', $tracker['id'])
+    //                 ->set(
+    //                     'pending_count',
+    //                     'GREATEST(pending_count - 1,0)',
+    //                     false
+    //                 )
+    //                 ->set('done_count', 'done_count + 1', false)
+    //                 ->set([
+    //                     'last_activity_at' => date('Y-m-d H:i:s'),
+    //                     'updated_at' => date('Y-m-d H:i:s')
+    //                 ])
+    //                 ->update();
+    //         } catch (Exception $e) {
+
+    //             $attempt_count
+    //                 = $record['attempt_count'] + 1;
+
+    //             $queue_status
+    //                 = ($attempt_count >= $max_attempt)
+    //                 ? 'failed'
+    //                 : 'pending';
+
+
+    //             $SchoolCommonModel->updateRecord(
+    //                 'sms_log',
+    //                 [
+    //                     'status'          => 0,
+    //                     'queue_status'    => $queue_status,
+    //                     'delivery_status' => 'failed',
+    //                     'attempt_count'   => $attempt_count,
+    //                     'last_error'      => $e->getMessage(),
+    //                     'ErrorCode'       => 1,
+    //                     'ErrorMessage'    => $e->getMessage(),
+    //                     'locked_at'       => null
+    //                 ],
+    //                 [
+    //                     'id' => $record['id']
+    //                 ]
+    //             );
+
+
+    //             $defaultDB->table('queue_db_tracker')
+    //                 ->where('id', $tracker['id'])
+    //                 ->set(
+    //                     'failed_count',
+    //                     'failed_count + 1',
+    //                     false
+    //                 )
+    //                 ->set([
+    //                     'last_activity_at'
+    //                     => date('Y-m-d H:i:s'),
+
+    //                     'updated_at'
+    //                     => date('Y-m-d H:i:s')
+    //                 ])
+    //                 ->update();
+    //         }
+    //     }
+
+    //     $finalTracker = $CommonModel->getResult(
+    //         '*',
+    //         'queue_db_tracker',
+    //         [
+    //             'id' => $tracker['id']
+    //         ]
+    //     );
+
+
+    //     if ($finalTracker && $finalTracker['pending_count'] <= 0) {
+    //         $CommonModel->deleteRecord(
+    //             'queue_db_tracker',
+    //             [
+    //                 'id' => $tracker['id']
+    //             ]
+    //         );
+    //     } else {
+
+    //         $CommonModel->updateRecord(
+    //             'queue_db_tracker',
+    //             [
+    //                 'current_status'   => 'pending',
+
+    //                 'last_activity_at'
+    //                 => date('Y-m-d H:i:s'),
+
+    //                 'updated_at'
+    //                 => date('Y-m-d H:i:s')
+    //             ],
+    //             [
+    //                 'id' => $tracker['id']
+    //             ]
+    //         );
+    //     }
+
+    //     echo "Queue Processed";
+    // }
+// }     
