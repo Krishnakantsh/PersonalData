@@ -1,0 +1,230 @@
+    public function sendStudentSms($data)
+    {
+        try {
+
+            $type = (int)$this->request->getPost('type');
+            $class_ids = json_decode($this->request->getPost('class_id'), true);
+            $division_ids = json_decode($this->request->getPost('division_id'), true);
+            $student_ids = json_decode($this->request->getPost('student_id'), true);
+            $template_id = $this->request->getPost('template_id');
+            $template_message = $this->request->getPost('message');
+            $language = $this->request->getPost('language');
+            $othermessage = $this->request->getPost('othermessage');
+            $title = $this->request->getPost('title');
+            $message_type = $this->request->getPost('message_type');
+            $file_url = $this->request->getPost('file_url');
+            $file_name = $this->request->getPost('file_name');
+            $file_type = $this->request->getPost('file_type');
+            $module_name = 'student-sms';
+
+            $param = [];
+            if (!empty($student_ids)) {
+                $param['student_id'] = $student_ids;
+            } else if (!empty($division_ids)) {
+                $param['division_id'] = $division_ids;
+            } else {
+                $param['class_id'] = $class_ids;
+            }
+
+            $students = $this->StudentModel->getStudents($data, $param);
+
+            preg_match_all('/{{(.*?)}}/', $template_message, $matches);
+
+            $response = [];
+            $SmsRecord = [];
+            $user_info = [];
+            $total_send = 0;
+
+            if (is_contain_vars($template_message)) {
+                foreach ($students as $student) {
+
+                    $parameters = genearte_student_whatsapp_msg_parameter($matches[1], $student);
+
+                    $message = replace_student_msg_vars($template_message, $student);
+
+                    if ($matches[1]) {
+                        $message = replace_student_whatsapp_msg_vars($template_message, $student);
+                    }
+
+                    $number = $student['contact_no_sms'];
+
+                    //Send Sms
+                    if ($type === 0) {
+                        $send = send_sms($data, [$number], $template_id, $message, $othermessage);
+                    }
+
+
+                    // send Notification
+                    else if ($type === 1) {
+
+
+                        // $allUserDetail = $this->defaultCommonModel->getResult('*', 'school_app_users', ['mobile_no' => $student['contact_no_sms'], 'registration_id' => $student['student_id'], 'school_id' => $data->allSchoolId, 'notification_token!=' => '', 'is_active' => 1, 'user_privilege_id' => 4]);
+
+                        $allUserDetail = $this->defaultCommonModel->getResult('*','school_app_users', 
+                        [ 'mobile_no' => $student['contact_no_sms'], 
+                        'registration_id' => $student['student_id'], 
+                        'school_id' => $data->allSchoolId, 
+                        'is_active' => 1, 
+                        'user_privilege_id' => 4] ); 
+                        
+                        $tokens = $this->defaultCommonModel->getMultipleResults( '*','user_device_tokens', 
+                        [ 
+                        'user_id' => $allUserDetail['id'], 
+                        'is_active' => 1 
+                        ]
+                        );
+
+                        $device_tokens = array_column($tokens, 'device_token');
+
+
+                        if (!$allUserDetail) {
+                            continue;
+                        }
+                        $record = [
+                            'message_id' => '',
+                            'students_id' => $student['student_id'],
+                            'mobile_no' => $student['contact_no_sms'],
+                            'user_type' => 1,
+                            'module' => $file_url,
+                            'type' => 'text',
+                            'title' => $title,
+                            'msg' => $message,
+                            // 'device_token' => $allUserDetail['notification_token'],
+                            'device_tokens' => $device_tokens,
+                            'send_by' => $data->userId,
+                            'created_by' => $data->userId,
+                            'school_id' => $data->schoolId,
+                            'session_id' => $data->sessionId,
+                        ];
+                        array_push($user_info, $record);
+                    }
+
+                    //Send Whatsapp Message
+                    else if ($type === 2) {
+                        $sending_arguments = [
+                            'campaign' => $title,
+                            'template_id' => $template_id,
+                            'recipients' => $number,
+                            'type' => $message_type,
+                            'message' => $message,
+                            'file_url' => $file_url,
+                            'file_name' => $file_name,
+                            'file_type' => $file_type,
+                            'language' => $language,
+                            'parameters' => $parameters
+                        ];
+                        array_push($SmsRecord, $sending_arguments);
+                    }
+                    if (isset($send['status']) && $send['status'] == 1) {
+                        $total_send++;
+                    }
+                }
+
+                if ($type === 1) {
+
+                    $payload = [
+                        'module_name' => $module_name,
+                        'file_url' => $file_url,
+                        'file_name' => $file_name
+                    ];
+                    $response =  $this->NotificationController->sendNotifications($data, $user_info, $payload);
+
+                    $total_send += $response['total_send'];
+                } else if ($type === 2) {
+                    $send = send_whatsapp($data, $SmsRecord, $template_id);
+                    
+                    if (isset($send) && $send['status']) {
+                        $total_send += $send['total_send'];
+                    }
+                }
+
+                if ($total_send > 0) {
+                    $response['status'] = 1;
+                    $response['ErrorMsg'] = 'success';
+                    // $response['total_send'] = $total_send;
+                    $response['total_send'] = '';
+                    $response['balance'] = get_sms_balance($data);
+                } else {
+                    $response['status'] = 0;
+                    $response['ErrorMsg'] = $send['ErrorMsg'];
+                    // $response['total_send'] = $total_send;
+                    $response['total_send'] = '';
+                    $response['balance'] = get_sms_balance($data);
+                }
+            } else {
+
+
+                $numbers = array_column($students, 'contact_no_sms');
+                $student_ids = array_column($students, 'student_id');
+
+                //Send Sms
+                if ($type === 0) {
+                    $response = send_sms($data, $numbers, $template_id, $template_message, $othermessage);
+                } else if ($type === 1) {
+
+                    $allUserDetail = $this->defaultCommonModel->getMultipleResults('*', 'school_app_users', ['mobile_no' => $numbers, 'registration_id' => $student_ids], ['school_id' => $data->allSchoolId, 'notification_token!=' => '', 'is_active' => 1, 'user_privilege_id' => 4]);
+
+                        $tokens = $this->defaultCommonModel->getMultipleResults( '*','user_device_tokens', 
+                        [ 
+                        'user_id' => $allUserDetail['id'], 
+                        'is_active' => 1 
+                        ]
+                        );
+
+                        $device_tokens = array_column($tokens, 'device_token');
+
+
+                        $payload = [
+                            'module_name' => $module_name,
+                            'file_url' => $file_url,
+                            'file_name' => $file_name
+                        ];
+
+                    foreach ($allUserDetail as $student) {
+                        $record = [
+                            'message_id' => '',
+                            'students_id' => $student['registration_id'],
+                            'mobile_no' => $student['mobile_no'],
+                            'user_type' => 1,
+                            'module' => $file_url,
+                            'type' => 'text',
+                            'title' => $title,
+                            'msg' => $template_message,
+                            'device_token' => $device_tokens,
+                            // 'device_token' => $student['notification_token'],
+                            'send_by' => $data->userId,
+                            'created_by' => $data->userId,
+                            'school_id' => $data->schoolId,
+                            'session_id' => $data->sessionId,
+                        ];
+                        array_push($user_info, $record);
+                    }
+
+                    $response =  $this->NotificationController->sendNotifications($data, $user_info, $payload);
+                } else if ($type === 2) {
+                    $sending_arguments = [];
+                    foreach ($numbers as $key => $number) {
+                        $arguments = [
+                            'campaign' => $title,
+                            'template_id' => $template_id,
+                            'recipients' => $number,
+                            'type' => $message_type,
+                            'message' => $template_message,
+                            'file_url' => $file_url,
+                            'file_name' => $file_name,
+                            'file_type' => $file_type,
+                            'language' => $language,
+                            'parameters' => []
+                        ];
+                        array_push($sending_arguments, $arguments);
+                    }
+
+                    $response = send_whatsapp($data, $sending_arguments, $template_id);
+                }
+            }
+            return $this->respond($response);
+        } catch (Exception $err) {
+            writeError($data->schoolName, 'SmsController.php', 'sendStudentSms', $err->getLine(), $err->getMessage());
+            return $this->fail($err->getMessage() . ' at line ' . $err->getLine() . ' in file ' . $err->getFile());
+        }
+    }      no response  ok 
