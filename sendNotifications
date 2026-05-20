@@ -1,0 +1,211 @@
+    //  added By Krishna Kant Sharma [ 19-05-2026 ]
+    public function sendNotifications($data, $user_info, $payload = [])
+    {
+        $db = db_connect($data->schoolName);
+        $this->CommonModel = new CommonModel($db);
+        $packet_size = 60;
+        $response = [];
+        $total_send = 0;
+        $module_name = $payload['module_name'] ?? '';
+        $file_url    = $payload['file_url'] ?? '';
+        $file_name   = $payload['file_name'] ?? '';
+
+        $batch_id = uniqid('BATCH_');
+
+        // packet system .................................
+
+        $packets = (count($user_info) > $packet_size)
+            ? array_chunk($user_info, $packet_size)
+            : [$user_info];
+
+        // process all packets.............................
+
+        foreach ($packets as $packet_key => $packet_users) {
+
+            $batchInsert = [];
+
+            foreach ($packet_users as $packet) {
+
+                $insertData = [
+                    'msg_id'              => uniqid('NOTI_'),
+                    'provider_message_id' => null,
+                    'mobile_no'           => $packet['mobile_no'] ?? '',
+                    'recipient_name'      => $packet['name'] ?? '',
+                    'device_tokens'        => json_encode(
+                        $packet['device_tokens'] ?? []
+                    ),
+                    'email'               => '',
+                    'message'             => $packet['msg'] ?? '',
+                    'title'               => $packet['title'] ?? '',
+                    'file_url'            => $file_url,
+                    'file_type'           => '',
+                    'file_name'           => $file_name,
+                    'othermessage'        => null,
+                    'status'              => 0,
+                    'queue_status'        => ($packet_key == 0)
+                        ? 'processing'
+                        : 'pending',
+                    'delivery_status'     => null,
+                    'attempt_count'       => 0,
+                    'last_error'          => null,
+                    'ErrorCode'           => 0,
+                    'ErrorMessage'        => '',
+                    'template_type'       => '',
+                    'service_type'        => 0,
+                    'template_category'   => '',
+                    'template_id'         => 0,
+                    'type'                => 1,
+                    'payload'             => json_encode($packet),
+                    'unique_key'          => md5(
+                        json_encode($packet)
+                    ),
+                    'user_id'             => $packet['user_id'] ?? 0,
+                    'school_id'           => $data->schoolId,
+                    'student_id'          => $packet['students_id'] ?? null,
+                    'session_id'          => $data->sessionId,
+                    'batch_id'            => $batch_id,
+                    'priority'            => 1,
+                    'process_after'       => date('Y-m-d H:i:s'),
+                    'processed_at'        => null,
+                    'locked_at'           => null,
+                    'provider_response'   => null,
+                    'source'              => $module_name,
+                    'created_by'          => $data->userId ?? null,
+                    'campaign_id'         => null,
+                    'campaign_name'       => null,
+                ];
+
+                if ($packet_key == 0) {
+
+                    $notification_id = $this->CommonModel
+                        ->insertRecord(
+                            'sms_log',
+                            $insertData,
+                            true
+                        );
+
+                    if ($notification_id) {
+
+                        $packet['notification_id']
+                            = $notification_id;
+
+                        $send = $this->sendPushNotification(
+                            $data,
+                            $packet,
+                            'function'
+                        );
+
+                        if (isset($send['success']) && $send['success']) {
+                            $total_send++;
+                            $this->CommonModel->updateRecord(
+                                'sms_log',
+                                [
+                                    'status'           => 1,
+                                    'queue_status'     => 'done',
+                                    'delivery_status'  => 'sent',
+                                    'processed_at'     => date('Y-m-d H:i:s'),
+                                    'provider_response' => json_encode($send)
+                                ],
+                                [
+                                    'id' => $notification_id
+                                ]
+                            );
+                        } else {
+
+                            $this->CommonModel->updateRecord(
+                                'sms_log',
+                                [
+                                    'status'          => 0,
+                                    'queue_status'    => 'failed',
+                                    'delivery_status' => 'failed',
+                                    'attempt_count'   => 1,
+                                    'last_error'      => $send['message']
+                                        ?? 'Notification Failed',
+                                    'provider_response' => json_encode($send)
+                                ],
+                                [
+                                    'id' => $notification_id
+                                ]
+                            );
+                        }
+                    }
+                } else {
+                    $batchInsert[] = $insertData;
+                }
+            }
+
+            if (!empty($batchInsert)) {
+
+                $this->CommonModel->batchInsertRecords(
+                    'sms_log',
+                    $batchInsert
+                );
+
+                // tracker update
+
+                $defaultDB = db_connect();
+
+                $DefaultCommonModel = new CommonModel(
+                    $defaultDB
+                );
+                $tracker = $DefaultCommonModel->getResult(
+                    '*',
+                    'queue_db_tracker',
+                    [
+                        'db_name' => $data->schoolName
+                    ]
+                );
+                $current_time = date('Y-m-d H:i:s');
+
+                if (!$tracker) {
+
+                    $DefaultCommonModel->insertRecord(
+                        'queue_db_tracker',
+                        [
+                            'db_name'          => $data->schoolName,
+                            'pending_count'    => count($batchInsert),
+                            'processing_count' => 0,
+                            'done_count'       => 0,
+                            'failed_count'     => 0,
+                            'current_status'   => 'pending',
+                            'started_at'       => $current_time,
+                            'last_queue_at'    => $current_time,
+                            'last_activity_at' => $current_time,
+                            'updated_at'       => $current_time
+                        ]
+                    );
+                } else {
+
+
+                    // update if already same tracker available based on db name 
+
+                    $DefaultCommonModel->updateRecord(
+                        'queue_db_tracker',
+                        [
+                            'pending_count'
+                            => (
+                                (int)$tracker['pending_count']
+                                + count($batchInsert)
+                            ),
+                            'current_status'   => 'pending',
+                            'last_queue_at'    => $current_time,
+                            'last_activity_at' => $current_time,
+                            'updated_at'       => $current_time
+                        ],
+                        [
+                            'db_name' => $data->schoolName
+                        ]
+                    );
+                }
+            }
+        }
+        $response = [
+            'status' => ($total_send > 0) ? 1 : 0,
+            'ErrorMsg' => ($total_send > 0)
+                ? 'Notification sent'
+                : 'Notification failed',
+            'total_send' => $total_send
+        ];
+
+        return $response;
+    }    just analyze not do any process 
